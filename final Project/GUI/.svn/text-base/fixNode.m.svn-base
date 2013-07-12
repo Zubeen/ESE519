@@ -1,0 +1,8 @@
+function [x, y] = fixNode(handles, N)
+
+t=0:2*pi/N:2*pi;
+x=sin(t);
+y=cos(t);
+axes(handles.axes1);
+plot(x, y, 'O');
+hold on;

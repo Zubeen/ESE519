@@ -1,0 +1,514 @@
+#include <nrk.h>
+#include <include.h>
+#include <ulib.h>
+#include <stdio.h>
+#include <avr/sleep.h>
+#include <hal.h>
+#include <rt_link.h>
+#include <nrk_error.h>
+#include <nrk_events.h>
+#include <nrk_driver.h>
+#include <nrk_driver_list.h>
+#include <ff_basic_sensor.h>
+#include <packetTypes.h>
+
+//constants related to power & signal strength
+#define MAX_POWER 3
+#define RSSI_THRESH -10
+
+//constants related to channel & slots
+#define MY_CHANNEL 14
+#define NODE_ID  2
+
+#define MY_TX_SLOT ((NODE_ID*2))
+#define GATEWAY_RX_SLOT  0
+#define NODE_1_RX_SLOT  2
+#define NODE_2_RX_SLOT  4
+#define NODE_3_RX_SLOT  6
+#define NODE_4_RX_SLOT  8
+#define NODE_5_RX_SLOT  10
+
+//constants related to time
+#define AUDIT_INTERVAL 5
+#define MAX_TTL 3
+#define HELLO_INTERVAL 10
+#define ROUTE_INTERVAL 15
+#define DATA_INTERVAL 30
+
+//time related variables
+nrk_time_t pingNeighborTime;
+nrk_time_t currentTime;
+nrk_time_t auditNeighborTime;
+nrk_time_t neighborListLastTime;
+nrk_time_t sensorLastTime;
+
+//everything related to the TX & RX process
+#define MAX_QUEUE_SIZE 6
+int front = 0; // del from here
+int rear = 0; // add from here
+uint8_t entry[MAX_QUEUE_SIZE];
+void addToTXBuffer(uint8_t toTX[], int8_t length);
+void fetchTxBuffer();
+uint8_t txQueue[MAX_QUEUE_SIZE][RF_MAX_PAYLOAD_SIZE];
+uint8_t tx_buf[RF_MAX_PAYLOAD_SIZE];
+uint8_t rx_buf[RF_MAX_PAYLOAD_SIZE];
+
+//other function declarations
+void handleRXPacket(int8_t senderNode, uint8_t* local_rx_buf,int8_t length, int8_t rssi);
+void periodicTxStuff();
+
+//task related NRK stuff
+NRK_STK Stack1[NRK_APP_STACKSIZE];
+nrk_task_type TaskOne;
+void Task1(void);
+void nrk_create_taskset();
+
+
+// arrays for routing table : not implemented something using pointers for now. done in the fastest, most efficient and least error prone way.
+int8_t timeStamp[6]={-1,-1,-1,-1,-1,-1};
+int8_t hopCountToGateway=0;
+int8_t nextHopToGateway=NODE_ID;
+bool neighbour[6]={false,false,false,false,false,false};
+int8_t neighbourRSSI[6];
+
+//sensor related
+uint8_t fd;
+uint8_t sensorLight=0;
+uint8_t sensorTemp=0;
+uint8_t sensorBat=0;
+
+//flags
+bool changeFlag=false;
+
+int main ()
+{
+
+	nrk_setup_ports();
+	nrk_setup_uart(UART_BAUDRATE_115K2);
+	nrk_kprintf( PSTR("Starting up...\r\n") );
+	nrk_init();
+
+	nrk_led_clr(0);
+	nrk_led_clr(1);
+	nrk_led_clr(2);
+	nrk_led_clr(3);
+  
+	nrk_time_set(0,0);
+
+	nrk_register_drivers();
+	rtl_task_config();
+	nrk_create_taskset ();
+
+	nrk_start();
+	
+	return 0;
+}
+
+
+void Task1()
+{
+
+	int8_t rssi, slot,length; //all parameters recieved along with an rx
+	int8_t senderNode;
+	uint8_t *local_rx_buf;
+	
+	printf( "Task1 PID=%d\r\n",nrk_get_pid());
+	printf( "Node ID=%d\r\n",NODE_ID);
+
+	nrk_led_set(GREEN_LED); 
+
+	rtl_init (RTL_MOBILE);
+	rtl_set_channel(MY_CHANNEL);
+  
+	rtl_set_schedule( RTL_RX, GATEWAY_RX_SLOT, 1 );
+	rtl_set_schedule( RTL_RX, NODE_1_RX_SLOT, 1 );
+	rtl_set_schedule( RTL_RX, NODE_3_RX_SLOT, 1 );
+	rtl_set_schedule( RTL_RX, NODE_4_RX_SLOT, 1 );
+	rtl_set_schedule( RTL_RX, NODE_5_RX_SLOT, 1 );
+	rtl_set_schedule( RTL_TX, MY_TX_SLOT, 1 ); 
+	rtl_set_tx_power(MAX_POWER);
+	rtl_rx_pkt_set_buffer(rx_buf, RF_MAX_PAYLOAD_SIZE); //to limit payload size
+	rtl_start();
+	
+	while(!rtl_ready())  nrk_wait_until_next_period();  
+	
+	fd=nrk_open(FIREFLY_SENSOR_BASIC,READ);
+		if(fd==NRK_ERROR) nrk_kprintf(PSTR("Failed to open sensor driver\r\n"));
+
+	
+	while(1)
+	{
+		
+		nrk_time_get(&currentTime);
+		
+		//Audit neighbours every AUDIT_INTERVAL seconds
+		if(currentTime.secs-auditNeighborTime.secs>AUDIT_INTERVAL)
+		{
+			auditNeighbors();
+		}
+		
+		if( rtl_tx_pkt_check(MY_TX_SLOT)!=0 )
+		{
+			//printf("Pending TX");
+		}
+		else
+		{
+			periodicTxStuff(); //If its time to send a periodic Hello Message or Data then add it to TX queue
+			fetchTxBuffer(); //Dequeue & Transmit
+               		nrk_led_toggle(BLUE_LED);
+		}
+ 
+ 		//Handling RX Messages
+		if( rtl_rx_pkt_check()!=0 )
+		{
+			local_rx_buf=rtl_rx_pkt_get(&length, &rssi, &slot);
+			senderNode=slot/2;
+			printf("\nSender:%d RSSI %d\n\r", senderNode, rssi);
+			if(rssi>=RSSI_THRESH) //Process packet only if the sender is in range
+			{
+				handleRXPacket(senderNode, &local_rx_buf[0], length, rssi);
+			}
+			nrk_kprintf( PSTR("\r\n") );
+			rtl_rx_pkt_release();
+		} 
+		rtl_wait_until_rx_or_tx();
+	}
+}
+
+void handleRXPacket(int8_t senderNode, uint8_t* local_rx_buf, int8_t length, int8_t rssi)
+{
+	//printf("In handleRXPacket : %c",local_rx_buf[5+PKT_DATA_START]);
+	//printf("Recived packet ");
+	/*for(int i=PKT_DATA_START; i<length; i++ )
+	{
+		printf("%c",local_rx_buf[i] );
+	}*/
+	//printf("\n\r");
+	int8_t nextnodeConcerned, nodeConcerned, hopcountConcerned;
+	if(local_rx_buf[5+PKT_DATA_START]==HELLO)
+	{
+		printf("%d : HELLO\n\r",senderNode);
+		//First, Store new neighbour
+		if(neighbour[senderNode]==false)
+		{
+			changeFlag=true;
+			neighbour[senderNode]=true;
+		}
+		timeStamp[senderNode]=MAX_TTL;
+		neighbourRSSI[senderNode]=rssi;
+		//Then, check if it provides a route to the gateway
+		if(senderNode==0) //WOW, Gateway seems to be my neighbour!
+		{
+			//printf("Gateway is my neighbour");
+			nextHopToGateway=0;
+			hopCountToGateway=1;
+		}
+		else
+		{
+			hopcountConcerned=local_rx_buf[9+PKT_DATA_START]-48;
+			nextnodeConcerned=local_rx_buf[11+PKT_DATA_START]-48;
+			//printf("%dhopcount",hopcountConcerned);
+			if(senderNode==nextHopToGateway) //if I get msg from existing next hop, I blindly update my info
+			{
+				hopCountToGateway=hopcountConcerned+1;
+			}
+			else if(hopcountConcerned!=0 && nextnodeConcerned!=NODE_ID) //2nd condition prevents count to infinity
+			{
+				if(hopCountToGateway==0) // found
+				{
+					//printf("I got a new route via %d", senderNode);
+					hopCountToGateway=hopcountConcerned+1;
+					nextHopToGateway=senderNode;
+				}
+				else if(hopcountConcerned+1<hopCountToGateway) //found better route by hops
+				{
+					//printf("XI got a new route via %d", senderNode);
+					hopCountToGateway=hopcountConcerned+1;
+					nextHopToGateway=senderNode;
+				}
+				else if(hopcountConcerned+1==hopCountToGateway) //equal hops, better rssi
+				{
+					if(rssi>=neighbourRSSI[nextHopToGateway])
+					{
+						hopCountToGateway=hopcountConcerned+1;
+						nextHopToGateway=senderNode;
+					}
+				}
+			}
+		}
+	}
+	else if(local_rx_buf[5+PKT_DATA_START]==ROUTE_ERROR)
+	{
+		if(neighbour[senderNode]==true) //process errors only if the packet is from a neighbour, don't trust anyone else
+        	{
+			printf("%d:Err",senderNode);
+			if(nextHopToGateway==senderNode)
+			{
+				printf("%d LRG",NODE_ID);
+				nextHopToGateway=NODE_ID;
+				hopCountToGateway=0;
+				//need to inform others that I no longer have a route to the gateway
+				//printf("sendError");
+				sprintf( &tx_buf[PKT_DATA_START],"Type=4");
+				length=strlen(&tx_buf[PKT_DATA_START])+PKT_DATA_START+1; //PKT_DATA_START + length of string + 1 for null at end of string
+				addToTXBuffer(tx_buf,length);
+			}
+		}
+	}
+	else if(local_rx_buf[5+PKT_DATA_START]==NEIGHBOUR_LIST)
+	{
+		int8_t destNode = local_rx_buf[7+PKT_DATA_START]-48;
+		if(destNode==NODE_ID)
+		{
+			//printf("got some neighbor info to be sent to the gate way from %d\n\r",senderNode);
+			local_rx_buf[7+PKT_DATA_START]=nextHopToGateway;
+			length=strlen(&local_rx_buf[PKT_DATA_START])+PKT_DATA_START+1;
+			addToTXBuffer(local_rx_buf,length);
+		}
+	}
+	else if(local_rx_buf[5+PKT_DATA_START]==SENSOR_DATA)
+	{
+		int8_t destNode = local_rx_buf[7+PKT_DATA_START]-48;
+		if(destNode==NODE_ID)
+		{
+			//printf("got some neighbor info to be sent to the gate way from %d\n\r",senderNode);
+			local_rx_buf[7+PKT_DATA_START]=nextHopToGateway;//change the next Hop
+			
+/*			I dreamed of aggregating sensor data by appending, but stupid string manipulation probs*/
+/*			sampleSensorData(); //update the global variables with latest sensor data and resets timer*/
+/*			length=strlen(&local_rx_buf[PKT_DATA_START])+PKT_DATA_START+1;*/
+/*			sprintf( &local_rx_buf[length],"%d %d %d %d %d",NODE_ID,sensorLight,sensorTemp,sensorBat);*/
+
+			length=strlen(&local_rx_buf[PKT_DATA_START])+PKT_DATA_START+1;
+			addToTXBuffer(local_rx_buf,length);
+		}
+	}
+}
+
+void auditNeighbors()
+{
+	//printf("in audit neighbours\n\r");
+	int8_t length;
+	uint8_t local_tx_buf[RF_MAX_PAYLOAD_SIZE];
+	for(int i = 0; i<6; i++)
+	{
+		if(i!=NODE_ID && neighbour[i]==true && timeStamp[i]>0) //audit function only for neighbours that are alive
+		{
+			timeStamp[i]--;	
+			if(timeStamp[i]==0)
+			{
+				//printf("%d Dead.",i);
+				changeFlag=true;
+				neighbour[i]=false;
+				if(nextHopToGateway==i)
+				{
+					//printf("Lost my route to the gateway");
+					nextHopToGateway=NODE_ID;
+					hopCountToGateway=0;
+					//need to inform others that I no longer have a route to the gateway
+					//printf("sendError");
+					//Sending error msg, not as imp given the nature of the hello packet
+					sprintf( &local_tx_buf[PKT_DATA_START],"Type=4");
+					length=strlen(&local_tx_buf[PKT_DATA_START])+PKT_DATA_START+1; //PKT_DATA_START + length of string + 1 for null at end of string
+					addToTXBuffer(local_tx_buf,length);
+				}
+			}
+		}
+	}
+	nrk_time_get(&auditNeighborTime);
+}
+
+void addToTXBuffer(uint8_t toTx[], int8_t length){
+
+/*	printf("ADD TO TX QUEUE: ");*/
+	for(int i=0; i<length; i++ )
+	{
+		txQueue[rear][i]=toTx[i] ;
+/*		printf("%c",txQueue[rear][i] );*/
+	}
+/*	printf("\n\r");*/
+	entry[rear]=1;	
+	rear++;
+	if(rear==MAX_QUEUE_SIZE)
+	{
+		rear=0;
+	}
+}
+
+
+void  fetchTxBuffer()
+{
+	// send stuff here
+	int8_t length;
+	if(entry[front]==1)
+	{
+		length=strlen(&txQueue[front][PKT_DATA_START])+PKT_DATA_START+1;
+/*		printf("transmitting from queue : ");*/
+/*		for(int i=PKT_DATA_START; i<length; i++ )*/
+/*		{*/
+/*			printf("%c",txQueue[front][i] );*/
+/*		}*/
+/*		printf("\n\r");*/
+		rtl_tx_pkt( &txQueue[front], length, MY_TX_SLOT);
+		entry[front]=0;
+		*txQueue[front] = " ";
+/*		printf("now the que is %s",txQueue[front]);*/
+		front++;
+		rtl_wait_until_rx_or_tx();
+	}
+	else
+	{
+		//printf("Nothing to send\n\r");
+	}
+	//wrap around
+	if(front==MAX_QUEUE_SIZE)
+	{
+		front=0;
+	}
+}
+
+
+void periodicTxStuff()
+{
+	// get the current time and see what all needs to be transmitted
+	nrk_time_get(&currentTime);
+	/*// do we need to send data to gateway?
+	if(currentTime.secs-sensorLastTime.secs>30){
+
+	sendSensorData(fd);
+	sprintf( &tx_buf[PKT_DATA_START],"%d %d %d",sensorLight,sensorTemp,sensorBat);	
+	//printf(	"%d %d %d",sensorLight,sensorTemp,sensorBat);	
+        length=strlen(&tx_buf[PKT_DATA_START])+PKT_DATA_START+1;
+
+	addToTXBuffer(tx_buf,length);
+	}*/
+	
+	// Periodically broadcast that I know route to gateway
+	if(currentTime.secs-pingNeighborTime.secs>HELLO_INTERVAL)
+	{
+		int8_t length;
+		sprintf( &tx_buf[PKT_DATA_START],"Type=1 H:%d %d",hopCountToGateway,nextHopToGateway);
+		 //PKT_DATA_START + length of string + 1 for null at end of string
+		length=strlen(&tx_buf[PKT_DATA_START])+PKT_DATA_START+1;
+		printf("Sending: ");
+		for(int i=PKT_DATA_START; i<length; i++ )
+		{
+			printf("%c",tx_buf[i] );
+		}
+		printf("\n\r");
+		addToTXBuffer(tx_buf,length);
+		nrk_time_get(&pingNeighborTime);
+	}
+	if(currentTime.secs - neighborListLastTime.secs > ROUTE_INTERVAL)// && changeFlag==true)
+	{
+		//uint8_t local_tx_buf[RF_MAX_PAYLOAD_SIZE];
+		int8_t length;
+		changeFlag=false;
+		printf("sending neigbors to gateway\n\r");
+		int8_t numOfNeighbors = 0;
+		for(int8_t i=0; i<6; i++)
+		{
+			if (neighbour[i]==true)
+			{
+            			numOfNeighbors++;
+            		}
+             	}
+		
+		sprintf(&tx_buf[PKT_DATA_START],"Type=6 %d %d %d ",nextHopToGateway,NODE_ID,2*numOfNeighbors);
+		int8_t j=13+PKT_DATA_START;
+
+		for(int8_t i=0; i<6; i++)
+		{
+			if (neighbour[i]==true)
+			{
+            			//printf("%c",i+'0');
+                		tx_buf[j]=i+'0';
+                		//printf("%c",local_tx_buf[j]);
+                		j++;
+                		tx_buf[j]=(neighbourRSSI[i]+10)+'0';
+                		j++;
+            		}
+             	}
+/*             	printf("\n\r");*/
+		length=strlen(&tx_buf[PKT_DATA_START])+PKT_DATA_START+1;
+/*             	for(int i=PKT_DATA_START; i<length; i++ )*/
+/*		{*/
+/*			printf("%c",tx_buf[i] );*/
+/*		}*/
+             	
+		addToTXBuffer(tx_buf,length);
+		nrk_time_get(&neighborListLastTime);
+	}
+	if(currentTime.secs - sensorLastTime.secs > DATA_INTERVAL)
+	{
+		uint8_t local_tx_buf[RF_MAX_PAYLOAD_SIZE];
+		int8_t length;
+		
+		sampleSensorData();
+		printf("Type=5 %d %d %d %d %d\n\r",nextHopToGateway,NODE_ID,sensorLight,sensorTemp,sensorBat);
+		sprintf( &local_tx_buf[PKT_DATA_START],"Type=5 %d %d %d %d %d",nextHopToGateway,NODE_ID,sensorLight,sensorTemp,sensorBat);
+		printf("sending to gateway %d %d %d\n\r",sensorLight,sensorTemp,sensorBat);	
+        	length=strlen(&local_tx_buf[PKT_DATA_START])+PKT_DATA_START+1;
+/*		for(int i=PKT_DATA_START; i<length; i++ )*/
+/*		{*/
+/*			//printf("%c",local_tx_buf[i] );*/
+/*		}*/
+		addToTXBuffer(local_tx_buf,length);
+	 	
+	}
+	
+}
+
+void sampleSensorData()
+{
+		uint8_t val_temp, val_light, val_bat,val;
+
+		val_light=nrk_set_status(fd,SENSOR_SELECT,LIGHT);
+		val=nrk_read(fd,&sensorLight,1); 	//read sensor output light
+	
+		val_temp=nrk_set_status(fd,SENSOR_SELECT,TEMP);
+		val=nrk_read(fd,&sensorTemp,1); 	//read sensor output temp
+
+		val_bat=nrk_set_status(fd,SENSOR_SELECT,BAT);
+		val=nrk_read(fd,&sensorBat,1); //read sensor output bat
+		nrk_time_get(&sensorLastTime);
+}
+
+/*PRE-EXISTING STUFF DO NOT TOUCH*/
+void nrk_create_taskset()
+{
+	TaskOne.task = Task1;
+	TaskOne.Ptos = (void *) &Stack1[NRK_APP_STACKSIZE-1];
+	TaskOne.Pbos = (void *) &Stack1[0];
+	TaskOne.prio = 2;
+	TaskOne.FirstActivation = TRUE;
+	TaskOne.Type = BASIC_TASK;
+	TaskOne.SchType = PREEMPTIVE;
+	TaskOne.period.secs = 1;
+	TaskOne.period.nano_secs = 0;
+	TaskOne.cpu_reserve.secs = 0;
+	TaskOne.cpu_reserve.nano_secs = 0;
+	TaskOne.cpu_reserve.nano_secs = 100*NANOS_PER_MS;
+	TaskOne.offset.secs = 0;
+	TaskOne.offset.nano_secs= 0;
+	nrk_activate_task (&TaskOne);
+	nrk_kprintf( PSTR("Create Done\r\n") );
+}
+
+
+void nrk_register_drivers()
+{
+	int8_t val;
+
+	// Register the Basic FireFly Sensor device driver
+	// Make sure to add: 
+	//     #define NRK_MAX_DRIVER_CNT  
+	//     in nrk_cfg.h
+	// Make sure to add: 
+	//     SRC += $(ROOT_DIR)/src/drivers/platform/$(PLATFORM_TYPE)/source/ff_basic_sensor.c
+	//     in makefile
+	val=nrk_register_driver( &dev_manager_ff_sensors,FIREFLY_SENSOR_BASIC);
+	if(val==NRK_ERROR) nrk_kprintf( PSTR("Failed to load my ADC driver\r\n") );
+
+}
+
